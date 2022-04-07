@@ -750,9 +750,14 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
 
     /// Mark a machine allocation that was just created as immutable.
     fn mark_immutable(&mut self, mplace: &MemPlace<Tag>) {
-        let this = self.eval_context_mut();
-        this.alloc_mark_immutable(mplace.ptr.into_pointer_or_addr().unwrap().provenance.alloc_id)
-            .unwrap();
+        if let machine::AllocType::Concrete(alloc_id) =
+            mplace.ptr.into_pointer_or_addr().unwrap().provenance.alloc_id
+        {
+            let this = self.eval_context_mut();
+            this.alloc_mark_immutable(alloc_id).unwrap();
+        } else {
+            bug!("Machine allocation that was just created have concrete provenance");
+        }
     }
 }
 
