@@ -26,6 +26,7 @@ pub type AllocExtra = Stacks;
 #[derive(Copy, Clone, Hash, PartialEq, Eq)]
 pub enum SbTag {
     Tagged(PtrId),
+    Wildcard(PtrId),
     Untagged,
 }
 
@@ -33,6 +34,7 @@ impl fmt::Debug for SbTag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SbTag::Tagged(id) => write!(f, "<{}>", id),
+            SbTag::Wildcard(id) => write!(f, "<wildcard {}>", id),
             SbTag::Untagged => write!(f, "<untagged>"),
         }
     }
@@ -82,11 +84,15 @@ pub struct Stack {
     /// * Above a `SharedReadOnly` there can only be more `SharedReadOnly`.
     /// * Except for `Untagged`, no tag occurs in the stack more than once.
     borrows: Vec<Item>,
+    /// Tags that should be treated as wildcards.
+    /// This is used for reborrows of pointers with wildcard tags.
+    treated_as_wildcard: FxHashSet<SbTag>,
 }
 
 /// Extra per-allocation state.
 #[derive(Clone, Debug)]
 pub struct Stacks {
+    /// RangeMap of all current SB stacks
     // Even reading memory can have effects on the stack, so we need a `RefCell` here.
     stacks: RefCell<RangeMap<Stack>>,
 }
@@ -100,6 +106,8 @@ pub struct GlobalStateInner {
     /// The base tag is the one used for the initial pointer.
     /// We need this in a separate table to handle cyclic statics.
     base_ptr_ids: FxHashMap<AllocId, SbTag>,
+    /// Hashset of all pointers that have been exposed
+    exposed_tags: FxHashSet<SbTag>,
     /// Next unused call ID (for protectors).
     next_call_id: CallId,
     /// Those call IDs corresponding to functions that are still running.
@@ -165,6 +173,7 @@ impl GlobalStateInner {
         GlobalStateInner {
             next_ptr_id: NonZeroU64::new(1).unwrap(),
             base_ptr_ids: FxHashMap::default(),
+            exposed_tags: FxHashSet::default(),
             next_call_id: NonZeroU64::new(1).unwrap(),
             active_calls: FxHashSet::default(),
             tracked_pointer_tag,
@@ -210,12 +219,26 @@ impl GlobalStateInner {
         })
     }
 
+    pub fn wildcard_tag(&mut self) -> SbTag {
+        SbTag::Wildcard(self.new_ptr())
+    }
+
     pub fn base_tag_untagged(&mut self, id: AllocId) -> SbTag {
         trace!("New allocation {:?} has no base tag (untagged)", id);
         let tag = SbTag::Untagged;
         // This must only be done on new allocations.
         self.base_ptr_ids.try_insert(id, tag).unwrap();
         tag
+    }
+
+    pub fn expose_ptr<'tcx>(&mut self, tag: SbTag) {
+        trace!("pointer exposed with tag {:?}", tag,);
+
+        if let SbTag::Tagged(_) = tag {
+            self.exposed_tags.insert(tag);
+        } else if self.tag_raw && tag == SbTag::Untagged {
+            bug!("expose_ptr called on invalid tag");
+        }
     }
 }
 
@@ -260,18 +283,30 @@ impl Permission {
 impl<'tcx> Stack {
     /// Find the item granting the given kind of access to the given tag, and return where
     /// it is on the stack.
-    fn find_granting(&self, access: AccessKind, tag: SbTag) -> Option<usize> {
+    fn find_granting(
+        &self,
+        access: AccessKind,
+        tag: SbTag,
+        global: &GlobalStateInner,
+    ) -> Option<usize> {
+        let is_wildcard =
+            matches!(tag, SbTag::Wildcard(_)) || self.treated_as_wildcard.contains(&tag);
+
         self.borrows
             .iter()
             .enumerate() // we also need to know *where* in the stack
             .rev() // search top-to-bottom
             // Return permission of first item that grants access.
             // We require a permission with the right tag, ensuring U3 and F3.
-            .find_map(
-                |(idx, item)| {
-                    if tag == item.tag && item.perm.grants(access) { Some(idx) } else { None }
-                },
-            )
+            .find_map(|(idx, item)| {
+                // a wildcard tag allows access to all exposed tags
+                let wildcard_match = is_wildcard && global.exposed_tags.contains(&item.tag);
+                if (wildcard_match || tag == item.tag) && item.perm.grants(access) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
     }
 
     /// Find the first write-incompatible item above the given one --
@@ -354,7 +389,7 @@ impl<'tcx> Stack {
 
         // Step 1: Find granting item.
         let granting_idx = self
-            .find_granting(access, tag)
+            .find_granting(access, tag, global)
             .ok_or_else(|| self.access_error(access, tag, alloc_id, range, offset))?;
 
         // Step 2: Remove incompatible items above them.  Make sure we do not remove protected
@@ -399,7 +434,7 @@ impl<'tcx> Stack {
         global: &GlobalStateInner,
     ) -> InterpResult<'tcx> {
         // Step 1: Find granting item.
-        self.find_granting(AccessKind::Write, tag).ok_or_else(|| {
+        self.find_granting(AccessKind::Write, tag, global).ok_or_else(|| {
             err_sb_ub(format!(
                 "no item granting write access for deallocation to tag {:?} at {:?} found in borrow stack",
                 tag, dbg_ptr,
@@ -433,7 +468,7 @@ impl<'tcx> Stack {
         // Now we figure out which item grants our parent (`derived_from`) this kind of access.
         // We use that to determine where to put the new item.
         let granting_idx = self
-            .find_granting(access, derived_from)
+            .find_granting(access, derived_from, global)
             .ok_or_else(|| self.grant_error(derived_from, new, alloc_id, alloc_range, offset))?;
 
         // Compute where to put the new item.
@@ -469,6 +504,10 @@ impl<'tcx> Stack {
         } else {
             trace!("reborrow: adding item {:?}", new);
             self.borrows.insert(new_idx, new);
+        }
+
+        if matches!(derived_from, SbTag::Wildcard(_)) && new.perm == Permission::SharedReadWrite {
+            self.treated_as_wildcard.insert(new.tag);
         }
 
         Ok(())
@@ -547,7 +586,7 @@ impl<'tcx> Stacks {
     /// Creates new stack with initial tag.
     fn new(size: Size, perm: Permission, tag: SbTag) -> Self {
         let item = Item { perm, tag, protector: None };
-        let stack = Stack { borrows: vec![item] };
+        let stack = Stack { borrows: vec![item], treated_as_wildcard: FxHashSet::default() };
 
         Stacks { stacks: RefCell::new(RangeMap::new(size, stack)) }
     }
@@ -702,6 +741,18 @@ trait EvalContextPrivExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
             );
             return Ok(());
         }
+        if matches!(new_tag, SbTag::Wildcard(_)) {
+            // Nothing to do for wildcard tags.
+            trace!(
+                "reborrow of wildcard: {} reference {:?} derived from {:?} (pointee {})",
+                kind,
+                new_tag,
+                place.ptr,
+                place.layout.ty,
+            );
+            return Ok(());
+        }
+
         let (alloc_id, base_offset, ptr) = this.ptr_get_alloc_id(place.ptr)?;
         let orig_tag = ptr.provenance.sb;
 
@@ -787,7 +838,6 @@ trait EvalContextPrivExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
     }
 
     /// Retags an indidual pointer, returning the retagged version.
-    /// `mutbl` can be `None` to make this a raw pointer.
     fn retag_reference(
         &mut self,
         val: &ImmTy<'tcx, Tag>,

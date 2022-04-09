@@ -166,9 +166,6 @@ impl Provenance for Tag {
 /// Extra per-allocation data
 #[derive(Debug, Clone)]
 pub struct AllocExtra {
-    // TODO: this really doesn't need to be here,
-    // but we're forced to bodge it here for now
-    pub alloc_id: AllocId,
     /// Stacked Borrows state is only added if it is enabled.
     pub stacked_borrows: Option<stacked_borrows::AllocExtra>,
     /// Data race detection via the use of a vector-clock,
@@ -579,7 +576,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
         };
         let alloc: Allocation<Tag, Self::AllocExtra> = alloc.convert_tag_add_extra(
             &ecx.tcx,
-            AllocExtra { alloc_id: id, stacked_borrows: stacks, data_race: race_alloc },
+            AllocExtra { stacked_borrows: stacks, data_race: race_alloc },
             |ptr| Evaluator::tag_alloc_base_pointer(ecx, ptr),
         );
         Cow::Owned(alloc)
@@ -611,15 +608,29 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
 
     /// Convert a pointer with provenance into an allocation-offset pair,
     /// or a `None` with an absolute address if that conversion is not possible.
-    fn ptr_get_alloc(
+    fn ptr_reify_alloc(
         ecx: &MiriEvalContext<'mir, 'tcx>,
         ptr: Pointer<Self::PointerTag>,
-    ) -> Option<(AllocId, Size)> {
-        intptrcast::GlobalStateInner::abs_ptr_to_rel(ecx, ptr)
+    ) -> Option<(AllocId, Size, Pointer<Self::PointerTag>)> {
+        let rel_ptr = intptrcast::GlobalStateInner::abs_ptr_to_rel(ecx, ptr);
+        rel_ptr.map(|(alloc_id, size)| {
+            let new_ptr =
+                ptr.map_provenance(|t| Tag { alloc_id: AllocType::Concrete(alloc_id), ..t });
+
+            (alloc_id, size, new_ptr)
+        })
     }
 
-    fn expose_addr(ecx: &MiriEvalContext<'mir, 'tcx>, ptr: Pointer<Self::PointerTag>) {
-        intptrcast::GlobalStateInner::expose_addr(ecx, ptr)
+    fn expose_ptr(ecx: &InterpCx<'mir, 'tcx, Self>, ptr: Pointer<Self::PointerTag>) {
+        let (tag, _) = ptr.into_parts();
+
+        if let AllocType::Concrete(alloc_id) = tag.alloc_id {
+            intptrcast::GlobalStateInner::expose_addr(ecx, alloc_id);
+
+            if let Some(stacked_borrows) = &ecx.machine.stacked_borrows {
+                stacked_borrows.borrow_mut().expose_ptr(tag.sb)
+            }
+        }
     }
 
     #[inline(always)]
@@ -630,12 +641,18 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
         tag: Tag,
         range: AllocRange,
     ) -> InterpResult<'tcx> {
+        let alloc_id = if let AllocType::Concrete(alloc_id) = tag.alloc_id {
+            alloc_id
+        } else {
+            bug!("`memory_read` called with non-concrete tag")
+        };
+
         if let Some(data_race) = &alloc_extra.data_race {
-            data_race.read(alloc_extra.alloc_id, range, machine.data_race.as_ref().unwrap())?;
+            data_race.read(alloc_id, range, machine.data_race.as_ref().unwrap())?;
         }
         if let Some(stacked_borrows) = &alloc_extra.stacked_borrows {
             stacked_borrows.memory_read(
-                alloc_extra.alloc_id,
+                alloc_id,
                 tag.sb,
                 range,
                 machine.stacked_borrows.as_ref().unwrap(),
@@ -653,12 +670,18 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
         tag: Tag,
         range: AllocRange,
     ) -> InterpResult<'tcx> {
+        let alloc_id = if let AllocType::Concrete(alloc_id) = tag.alloc_id {
+            alloc_id
+        } else {
+            bug!("`memory_written` called with non-concrete tag")
+        };
+
         if let Some(data_race) = &mut alloc_extra.data_race {
-            data_race.write(alloc_extra.alloc_id, range, machine.data_race.as_mut().unwrap())?;
+            data_race.write(alloc_id, range, machine.data_race.as_mut().unwrap())?;
         }
         if let Some(stacked_borrows) = &mut alloc_extra.stacked_borrows {
             stacked_borrows.memory_written(
-                alloc_extra.alloc_id,
+                alloc_id,
                 tag.sb,
                 range,
                 machine.stacked_borrows.as_mut().unwrap(),
@@ -676,19 +699,21 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
         tag: Tag,
         range: AllocRange,
     ) -> InterpResult<'tcx> {
-        if Some(alloc_extra.alloc_id) == machine.tracked_alloc_id {
-            register_diagnostic(NonHaltingDiagnostic::FreedAlloc(alloc_extra.alloc_id));
+        let alloc_id = if let AllocType::Concrete(alloc_id) = tag.alloc_id {
+            alloc_id
+        } else {
+            bug!("`memory_deallocated` called with non-concrete tag")
+        };
+
+        if Some(alloc_id) == machine.tracked_alloc_id {
+            register_diagnostic(NonHaltingDiagnostic::FreedAlloc(alloc_id));
         }
         if let Some(data_race) = &mut alloc_extra.data_race {
-            data_race.deallocate(
-                alloc_extra.alloc_id,
-                range,
-                machine.data_race.as_mut().unwrap(),
-            )?;
+            data_race.deallocate(alloc_id, range, machine.data_race.as_mut().unwrap())?;
         }
         if let Some(stacked_borrows) = &mut alloc_extra.stacked_borrows {
             stacked_borrows.memory_deallocated(
-                alloc_extra.alloc_id,
+                alloc_id,
                 tag.sb,
                 range,
                 machine.stacked_borrows.as_mut().unwrap(),

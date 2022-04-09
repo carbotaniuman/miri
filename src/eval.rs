@@ -112,6 +112,9 @@ pub struct MiriConfig {
     pub panic_on_unsupported: bool,
     /// Which style to use for printing backtraces.
     pub backtrace_style: BacktraceStyle,
+    /// Whether to enforce "permissive provenance" rules. Enabling this means int2ptr casts return
+    /// pointers with union provenance of all exposed pointers (and SB tags, if enabled).
+    pub permissive_provenance: bool,
     /// Whether to enforce "strict provenance" rules. Enabling this means int2ptr casts return
     /// pointers with an invalid provenance, i.e., not valid for any memory access.
     pub strict_provenance: bool,
@@ -140,6 +143,7 @@ impl Default for MiriConfig {
             measureme_out: None,
             panic_on_unsupported: false,
             backtrace_style: BacktraceStyle::Short,
+            permissive_provenance: false,
             strict_provenance: false,
         }
     }

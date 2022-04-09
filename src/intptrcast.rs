@@ -27,6 +27,9 @@ pub struct GlobalStateInner {
     /// This is used as a memory address when a new pointer is casted to an integer. It
     /// is always larger than any address that was previously made part of a block.
     next_base_addr: u64,
+    /// Whether to enforce "permissive provenance" rules. Enabling this means int2ptr casts return
+    /// pointers with union provenance of all exposed pointers (and SB tags, if enabled).
+    permissive_provenance: bool,
     /// Whether to enforce "strict provenance" rules. Enabling this means int2ptr casts return
     /// pointers with an invalid provenance, i.e., not valid for any memory access.
     strict_provenance: bool,
@@ -39,6 +42,7 @@ impl GlobalStateInner {
             base_addr: FxHashMap::default(),
             exposed: FxHashSet::default(),
             next_base_addr: STACK_ADDR,
+            permissive_provenance: config.permissive_provenance,
             strict_provenance: config.strict_provenance,
         }
     }
@@ -47,7 +51,7 @@ impl GlobalStateInner {
 impl<'mir, 'tcx> GlobalStateInner {
     // Returns the `AllocId` that corresponds to the specified addr,
     // or `None` if the addr is out of bounds
-    fn alloc_id_from_addr(addr: u64, ecx: &MiriEvalContext<'mir, 'tcx>) -> Option<AllocId> {
+    fn alloc_id_from_addr(ecx: &MiriEvalContext<'mir, 'tcx>, addr: u64) -> Option<AllocId> {
         let global_state = ecx.machine.intptrcast.borrow();
 
         if addr == 0 {
@@ -60,7 +64,7 @@ impl<'mir, 'tcx> GlobalStateInner {
             Ok(pos) => {
                 let (_, alloc_id) = global_state.int_to_ptr_map[pos];
 
-                if global_state.exposed.contains(&alloc_id) {
+                if !global_state.permissive_provenance || global_state.exposed.contains(&alloc_id) {
                     Some(global_state.int_to_ptr_map[pos].1)
                 } else {
                     None
@@ -75,7 +79,7 @@ impl<'mir, 'tcx> GlobalStateInner {
                 let offset = addr - glb;
                 // If the offset exceeds the size of the allocation, don't use this `alloc_id`.
 
-                if global_state.exposed.contains(&alloc_id)
+                if (!global_state.permissive_provenance || global_state.exposed.contains(&alloc_id))
                     && offset
                         <= ecx
                             .get_alloc_size_and_align(alloc_id, AllocCheck::MaybeDead)
@@ -91,13 +95,9 @@ impl<'mir, 'tcx> GlobalStateInner {
         }
     }
 
-    pub fn expose_addr(ecx: &MiriEvalContext<'mir, 'tcx>, ptr: Pointer<Tag>) {
+    pub fn expose_addr(ecx: &MiriEvalContext<'mir, 'tcx>, alloc_id: AllocId) {
         let mut global_state = ecx.machine.intptrcast.borrow_mut();
-        let (tag, _) = ptr.into_parts();
-
-        if let machine::AllocType::Concrete(alloc_id) = tag.alloc_id {
-            global_state.exposed.insert(alloc_id);
-        }
+        global_state.exposed.insert(alloc_id);
     }
 
     pub fn abs_ptr_to_rel(
@@ -109,7 +109,7 @@ impl<'mir, 'tcx> GlobalStateInner {
         let alloc_id = if let machine::AllocType::Concrete(alloc_id) = tag.alloc_id {
             alloc_id
         } else {
-            match GlobalStateInner::alloc_id_from_addr(addr.bytes(), ecx) {
+            match GlobalStateInner::alloc_id_from_addr(ecx, addr.bytes()) {
                 Some(alloc_id) => alloc_id,
                 None => return None,
             }
@@ -135,11 +135,22 @@ impl<'mir, 'tcx> GlobalStateInner {
             return Pointer::new(None, Size::from_bytes(addr));
         }
 
-        let alloc_id = GlobalStateInner::alloc_id_from_addr(addr, ecx);
+        let alloc_id = GlobalStateInner::alloc_id_from_addr(ecx, addr);
 
         // Pointers created from integers are untagged.
+
+        let sb = if let Some(stacked_borrows) = &ecx.machine.stacked_borrows {
+            if global_state.permissive_provenance {
+                stacked_borrows.borrow_mut().wildcard_tag()
+            } else {
+                SbTag::Untagged
+            }
+        } else {
+            SbTag::Untagged
+        };
+
         Pointer::new(
-            alloc_id.map(|_| Tag { alloc_id: machine::AllocType::Casted, sb: SbTag::Untagged }),
+            alloc_id.map(|_| Tag { alloc_id: machine::AllocType::Casted, sb }),
             Size::from_bytes(addr),
         )
     }
