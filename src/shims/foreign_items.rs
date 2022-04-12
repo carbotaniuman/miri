@@ -373,7 +373,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
             "miri_static_root" => {
                 let &[ref ptr] = this.check_shim(abi, Abi::Rust, link_name, args)?;
                 let ptr = this.read_pointer(ptr)?;
-                let (alloc_id, offset, _) = this.ptr_get_alloc_id(ptr)?;
+                let (alloc_id, offset, _) = this.ptr_reify_alloc(ptr)?;
                 if offset != Size::ZERO {
                     throw_unsup_format!("pointer passed to miri_static_root must point to beginning of an allocated block");
                 }

@@ -96,6 +96,8 @@ impl<'mir, 'tcx> GlobalStateInner {
     }
 
     pub fn expose_addr(ecx: &MiriEvalContext<'mir, 'tcx>, alloc_id: AllocId) {
+        trace!("Exposing allocation id {:?}", alloc_id);
+
         let mut global_state = ecx.machine.intptrcast.borrow_mut();
         global_state.exposed.insert(alloc_id);
     }

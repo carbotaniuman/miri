@@ -154,8 +154,12 @@ impl Provenance for Tag {
         write!(f, "{:?}", tag.sb)
     }
 
+    fn is_permissive(self) -> bool {
+        matches!(self.alloc_id, AllocType::Casted)
+    }
+
     fn get_alloc_id(self) -> Option<AllocId> {
-        if let machine::AllocType::Concrete(alloc_id) = self.alloc_id {
+        if let AllocType::Concrete(alloc_id) = self.alloc_id {
             Some(alloc_id)
         } else {
             None
@@ -621,16 +625,35 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
         })
     }
 
-    fn expose_ptr(ecx: &InterpCx<'mir, 'tcx, Self>, ptr: Pointer<Self::PointerTag>) {
+    #[inline(always)]
+    fn expose_ptr(
+        ecx: &mut InterpCx<'mir, 'tcx, Self>,
+        ptr: Pointer<Self::PointerTag>
+    ) -> InterpResult<'tcx> {
         let (tag, _) = ptr.into_parts();
 
+        // We have a concrete pointer, so we don't need to reify it.
         if let AllocType::Concrete(alloc_id) = tag.alloc_id {
             intptrcast::GlobalStateInner::expose_addr(ecx, alloc_id);
+            
+            let (size, _) = ecx.get_alloc_size_and_align(alloc_id, AllocCheck::MaybeDead).unwrap();
 
-            if let Some(stacked_borrows) = &ecx.machine.stacked_borrows {
-                stacked_borrows.borrow_mut().expose_ptr(tag.sb)
+            // Function pointers and dead objects don't have an alloc_extra so we ignore them.
+            if let Ok((alloc_extra, machine)) = ecx.get_alloc_extra_mut(alloc_id) {
+                if let Some(stacked_borrows) = &mut alloc_extra.stacked_borrows {
+                    stacked_borrows.ptr_exposed(
+                        alloc_id,
+                        tag.sb,
+                        alloc_range(Size::from_bytes(0), size),
+                        machine.stacked_borrows.as_ref().unwrap(),
+                    )?;
+                }
             }
         }
+
+        // no need to do anything for casted pointers
+        // their provenances have already been previously exposed
+        Ok(())
     }
 
     #[inline(always)]
