@@ -771,8 +771,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
     fn mark_immutable(&mut self, mplace: &MemPlace<Tag>) {
         let this = self.eval_context_mut();
         // This got just allocated, so there definitely is a pointer here.
-        this.alloc_mark_immutable(mplace.ptr.into_pointer_or_addr().unwrap().provenance.alloc_id)
-            .unwrap();
+        let provenance = mplace.ptr.into_pointer_or_addr().unwrap().provenance;
+
+        if let Tag::Concrete(concrete) = provenance {
+            this.alloc_mark_immutable(concrete.alloc_id).unwrap();
+        } else {
+            bug!("Machine allocation that was just created should have concrete provenance");
+        }
     }
 }
 

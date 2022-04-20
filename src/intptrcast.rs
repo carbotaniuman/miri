@@ -4,7 +4,7 @@ use std::collections::hash_map::Entry;
 use log::trace;
 use rand::Rng;
 
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_target::abi::{HasDataLayout, Size};
 
 use crate::*;
@@ -21,9 +21,16 @@ pub struct GlobalStateInner {
     /// they do not have an `AllocExtra`.
     /// This is the inverse of `int_to_ptr_map`.
     base_addr: FxHashMap<AllocId, u64>,
+    /// Whether an allocation has been exposed or not. This cannot be put
+    /// into `AllocExtra` for the same reason as `base_addr`.
+    exposed: FxHashSet<AllocId>,
     /// This is used as a memory address when a new pointer is casted to an integer. It
     /// is always larger than any address that was previously made part of a block.
     next_base_addr: u64,
+    /// Whether to allow "permissive provenance" rules. Enabling this means int2ptr casts return
+    /// pointers with "wildcard" provenance that basically match that of all exposed pointers
+    /// (and SB tags, if enabled).
+    permissive_provenance: bool,
     /// Whether to enforce "strict provenance" rules. Enabling this means int2ptr casts return
     /// pointers with an invalid provenance, i.e., not valid for any memory access.
     strict_provenance: bool,
@@ -34,24 +41,32 @@ impl GlobalStateInner {
         GlobalStateInner {
             int_to_ptr_map: Vec::default(),
             base_addr: FxHashMap::default(),
+            exposed: FxHashSet::default(),
             next_base_addr: STACK_ADDR,
+            permissive_provenance: config.permissive_provenance,
             strict_provenance: config.strict_provenance,
         }
     }
 }
 
 impl<'mir, 'tcx> GlobalStateInner {
-    pub fn ptr_from_addr(addr: u64, ecx: &MiriEvalContext<'mir, 'tcx>) -> Pointer<Option<Tag>> {
-        trace!("Casting 0x{:x} to a pointer", addr);
+    // Returns the `AllocId` that corresponds to the specified addr,
+    // or `None` if the addr is out of bounds
+    fn alloc_id_from_addr(ecx: &MiriEvalContext<'mir, 'tcx>, addr: u64) -> Option<AllocId> {
         let global_state = ecx.machine.intptrcast.borrow();
 
-        if global_state.strict_provenance {
-            return Pointer::new(None, Size::from_bytes(addr));
-        }
-
         let pos = global_state.int_to_ptr_map.binary_search_by_key(&addr, |(addr, _)| *addr);
-        let alloc_id = match pos {
-            Ok(pos) => Some(global_state.int_to_ptr_map[pos].1),
+
+        match pos {
+            Ok(pos) => {
+                let (_, alloc_id) = global_state.int_to_ptr_map[pos];
+
+                if !global_state.permissive_provenance || global_state.exposed.contains(&alloc_id) {
+                    Some(global_state.int_to_ptr_map[pos].1)
+                } else {
+                    None
+                }
+            }
             Err(0) => None,
             Err(pos) => {
                 // This is the largest of the adresses smaller than `int`,
@@ -60,24 +75,39 @@ impl<'mir, 'tcx> GlobalStateInner {
                 // This never overflows because `addr >= glb`
                 let offset = addr - glb;
                 // If the offset exceeds the size of the allocation, don't use this `alloc_id`.
-                if offset
-                    <= ecx
-                        .get_alloc_size_and_align(alloc_id, AllocCheck::MaybeDead)
-                        .unwrap()
-                        .0
-                        .bytes()
+
+                if (!global_state.permissive_provenance || global_state.exposed.contains(&alloc_id))
+                    && offset
+                        <= ecx
+                            .get_alloc_size_and_align(alloc_id, AllocCheck::MaybeDead)
+                            .unwrap()
+                            .0
+                            .bytes()
                 {
                     Some(alloc_id)
                 } else {
                     None
                 }
             }
-        };
-        // Pointers created from integers are untagged.
-        Pointer::new(
-            alloc_id.map(|alloc_id| Tag { alloc_id, sb: SbTag::Untagged }),
-            Size::from_bytes(addr),
-        )
+        }
+    }
+
+    pub fn expose_addr(ecx: &MiriEvalContext<'mir, 'tcx>, alloc_id: AllocId) {
+        trace!("Exposing allocation id {:?}", alloc_id);
+
+        let mut global_state = ecx.machine.intptrcast.borrow_mut();
+        global_state.exposed.insert(alloc_id);
+    }
+
+    pub fn ptr_from_addr(ecx: &MiriEvalContext<'mir, 'tcx>, addr: u64) -> Pointer<Option<Tag>> {
+        trace!("Casting 0x{:x} to a pointer", addr);
+        let global_state = ecx.machine.intptrcast.borrow();
+
+        if addr == 0 || global_state.strict_provenance {
+            return Pointer::new(None, Size::from_bytes(addr));
+        }
+
+        Pointer::new(Some(Tag::Wildcard), Size::from_bytes(addr))
     }
 
     fn alloc_base_addr(ecx: &MiriEvalContext<'mir, 'tcx>, alloc_id: AllocId) -> u64 {
@@ -128,7 +158,7 @@ impl<'mir, 'tcx> GlobalStateInner {
 
     /// Convert a relative (tcx) pointer to an absolute address.
     pub fn rel_ptr_to_addr(ecx: &MiriEvalContext<'mir, 'tcx>, ptr: Pointer<AllocId>) -> u64 {
-        let (alloc_id, offset) = ptr.into_parts(); // offset is relative (AllocId provenance)
+        let (alloc_id, offset) = ptr.into_parts(); // offset is relative
         let base_addr = GlobalStateInner::alloc_base_addr(ecx, alloc_id);
 
         // Add offset with the right kind of pointer-overflowing arithmetic.
@@ -136,14 +166,30 @@ impl<'mir, 'tcx> GlobalStateInner {
         dl.overflowing_offset(base_addr, offset.bytes()).0
     }
 
-    pub fn abs_ptr_to_rel(ecx: &MiriEvalContext<'mir, 'tcx>, ptr: Pointer<Tag>) -> Size {
+    pub fn abs_ptr_to_rel(
+        ecx: &MiriEvalContext<'mir, 'tcx>,
+        ptr: Pointer<Tag>,
+    ) -> Option<(AllocId, Size)> {
         let (tag, addr) = ptr.into_parts(); // addr is absolute (Tag provenance)
-        let base_addr = GlobalStateInner::alloc_base_addr(ecx, tag.alloc_id);
+
+        let alloc_id = if let Tag::Concrete(concrete) = tag {
+            concrete.alloc_id
+        } else {
+            match GlobalStateInner::alloc_id_from_addr(ecx, addr.bytes()) {
+                Some(alloc_id) => alloc_id,
+                None => return None,
+            }
+        };
+
+        let base_addr = GlobalStateInner::alloc_base_addr(ecx, alloc_id);
 
         // Wrapping "addr - base_addr"
         let dl = ecx.data_layout();
         let neg_base_addr = (base_addr as i64).wrapping_neg();
-        Size::from_bytes(dl.overflowing_signed_offset(addr.bytes(), neg_base_addr).0)
+        Some((
+            alloc_id,
+            Size::from_bytes(dl.overflowing_signed_offset(addr.bytes(), neg_base_addr).0),
+        ))
     }
 
     /// Shifts `addr` to make it aligned with `align` by rounding `addr` to the smallest multiple
