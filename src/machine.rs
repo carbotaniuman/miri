@@ -628,6 +628,14 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
     }
 
     #[inline(always)]
+    fn ptr_from_casted_addr(
+        ecx: &MiriEvalContext<'mir, 'tcx>,
+        addr: u64,
+    ) -> Pointer<Option<Self::PointerTag>> {
+        intptrcast::GlobalStateInner::ptr_from_casted_addr(ecx, addr)
+    }
+
+    #[inline(always)]
     fn expose_ptr(
         ecx: &mut InterpCx<'mir, 'tcx, Self>,
         ptr: Pointer<Self::PointerTag>,

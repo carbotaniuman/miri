@@ -98,6 +98,14 @@ impl<'mir, 'tcx> GlobalStateInner {
     }
 
     pub fn ptr_from_addr(ecx: &MiriEvalContext<'mir, 'tcx>, addr: u64) -> Pointer<Option<Tag>> {
+        trace!("Transmuting 0x{:x} to a pointer", addr);
+
+        // TODO: fix this at some point once we deal with function pointers
+        // Pointer::new(None, Size::from_bytes(addr))
+        Self::ptr_from_casted_addr(ecx, addr)
+    }
+
+    pub fn ptr_from_casted_addr(ecx: &MiriEvalContext<'mir, 'tcx>, addr: u64) -> Pointer<Option<Tag>> {
         trace!("Casting 0x{:x} to a pointer", addr);
         let global_state = ecx.machine.intptrcast.borrow();
 
