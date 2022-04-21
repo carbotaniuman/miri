@@ -58,15 +58,7 @@ impl<'mir, 'tcx> GlobalStateInner {
         let pos = global_state.int_to_ptr_map.binary_search_by_key(&addr, |(addr, _)| *addr);
 
         match pos {
-            Ok(pos) => {
-                let (_, alloc_id) = global_state.int_to_ptr_map[pos];
-
-                if !global_state.permissive_provenance || global_state.exposed.contains(&alloc_id) {
-                    Some(global_state.int_to_ptr_map[pos].1)
-                } else {
-                    None
-                }
-            }
+            Ok(pos) => Some(global_state.int_to_ptr_map[pos].1),
             Err(0) => None,
             Err(pos) => {
                 // This is the largest of the adresses smaller than `int`,
@@ -76,13 +68,12 @@ impl<'mir, 'tcx> GlobalStateInner {
                 let offset = addr - glb;
                 // If the offset exceeds the size of the allocation, don't use this `alloc_id`.
 
-                if (!global_state.permissive_provenance || global_state.exposed.contains(&alloc_id))
-                    && offset
-                        <= ecx
-                            .get_alloc_size_and_align(alloc_id, AllocCheck::MaybeDead)
-                            .unwrap()
-                            .0
-                            .bytes()
+                if offset
+                    <= ecx
+                        .get_alloc_size_and_align(alloc_id, AllocCheck::MaybeDead)
+                        .unwrap()
+                        .0
+                        .bytes()
                 {
                     Some(alloc_id)
                 } else {
@@ -90,6 +81,13 @@ impl<'mir, 'tcx> GlobalStateInner {
                 }
             }
         }
+        .and_then(|alloc_id| {
+            if global_state.permissive_provenance && !global_state.exposed.contains(&alloc_id) {
+                None
+            } else {
+                Some(alloc_id)
+            }
+        })
     }
 
     pub fn expose_addr(ecx: &MiriEvalContext<'mir, 'tcx>, alloc_id: AllocId) {

@@ -772,12 +772,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
         let this = self.eval_context_mut();
         // This got just allocated, so there definitely is a pointer here.
         let provenance = mplace.ptr.into_pointer_or_addr().unwrap().provenance;
-
-        if let Tag::Concrete(concrete) = provenance {
-            this.alloc_mark_immutable(concrete.alloc_id).unwrap();
-        } else {
-            bug!("Machine allocation that was just created should have concrete provenance");
-        }
+        this.alloc_mark_immutable(provenance.get_alloc_id().unwrap()).unwrap();
     }
 }
 
