@@ -115,7 +115,24 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 );
             }
 
-            let address = this.read_pointer(&args[1])?;
+            // TODO: Fix this monstrosity
+            let scalar = this.read_scalar(&args[1])?.check_init()?;
+            let address = match scalar
+                .to_bits_or_ptr_internal(this.pointer_size())
+                .map_err(|s| err_ub!(ScalarSizeMismatch(s)))?
+            {
+                Err(ptr) => ptr.into(),
+                Ok(_) => {
+                    let scalar = this.cast_from_int_like(
+                        scalar,
+                        args[1].layout,
+                        this.machine.layouts.mut_raw_ptr.ty,
+                    )?;
+
+                    this.scalar_to_ptr(scalar).unwrap()
+                }
+            };
+
             let mut name = this.read_c_str(address)?.to_owned();
             // The name should be no more than 16 bytes, including the null
             // byte. Since `read_c_str` returns the string without the null
@@ -130,7 +147,24 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriEvalContextExt<'mir, 'tcx
                 );
             }
 
-            let address = this.read_pointer(&args[1])?;
+            // TODO: Fix this monstrosity
+            let scalar = this.read_scalar(&args[1])?.check_init()?;
+            let address = match scalar
+                .to_bits_or_ptr_internal(this.pointer_size())
+                .map_err(|s| err_ub!(ScalarSizeMismatch(s)))?
+            {
+                Err(ptr) => ptr.into(),
+                Ok(_) => {
+                    let scalar = this.cast_from_int_like(
+                        scalar,
+                        args[1].layout,
+                        this.machine.layouts.mut_raw_ptr.ty,
+                    )?;
+
+                    this.scalar_to_ptr(scalar).unwrap()
+                }
+            };
+
             let mut name = this.get_active_thread_name().to_vec();
             name.push(0u8);
             assert!(name.len() <= 16);

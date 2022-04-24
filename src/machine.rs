@@ -624,6 +624,9 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for Evaluator<'mir, 'tcx> {
         ecx: &MiriEvalContext<'mir, 'tcx>,
         addr: u64,
     ) -> Pointer<Option<Self::PointerTag>> {
+        if addr == 0x90aaa {
+            panic!("AAAAAAAAAA");
+        }
         intptrcast::GlobalStateInner::ptr_from_addr(ecx, addr)
     }
 
